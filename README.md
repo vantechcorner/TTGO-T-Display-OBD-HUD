@@ -1,13 +1,15 @@
 # TTGO T-Display OBD HUD
 
-Firmware for the **LilyGO TTGO T-Display** (ESP32, ST7789 135×240, USB‑C): connects over **Bluetooth Classic** to an **ELM327** OBD-II adapter and draws a **LVGL 9** dashboard (RPM, speed, coolant temperature, battery voltage).
+Firmware for the **LilyGO TTGO T-Display** (ESP32, ST7789 135×240, USB‑C): connects over **Bluetooth Classic** to an **ELM327** OBD-II adapter and draws a **LVGL 9** dashboard (RPM, speed, coolant temperature, battery voltage). Backlight brightness is adjusted with the **onboard GPIO35 button** (V1.1).
 
 ### Firmware versions
 
-| Version | Notes |
-|---------|--------|
-| **V1.00** | Stable baseline: fixed backlight, full telemetry UI. |
-| **V1.1** | Adds **auto backlight** from OBD **Mode 01 PID `0x3E`** (*Auxiliary input / output status*): if the masked bit(s) indicate “lights on”, backlight PWM is set to **20%**; otherwise **100%**. If the ECU never returns `41 3E …` (unsupported / `NO DATA`), brightness stays at **100%**. Bit meanings are **not standardized** across brands — you may need to change `OBD_LIGHTS_ON_MASK` in `platformio.ini` or use a scope / log to find the correct bit for your car. |
+
+| Version  | Notes                                                                                         |
+| -------- | --------------------------------------------------------------------------------------------- |
+| **V1.0** | Stable baseline: fixed backlight, full telemetry UI.                                        |
+| **V1.1** | **Button backlight:** short press on **BUTTON1 (GPIO35)** cycles PWM **100% → 50% → 20% → 100%** (debounced). LilyGO pin table: **BUTTON1 = 35**, **BUTTON2 = 0** ([pinmap](https://raw.githubusercontent.com/Xinyuan-LilyGO/TTGO-T-Display/master/image/pinmap.jpg)). |
+
 
 ## Tested adapter (reference setup)
 
@@ -21,16 +23,16 @@ This project is written for adapters that expose a **Bluetooth Classic (BR/EDR, 
 
 The firmware opens a **BluetoothSerial** connection using the name (and optionally the MAC) compiled into the binary.
 
-1. Open **`platformio.ini`** in the project root.
-2. In **`[env:ttgo_t_display]` → `build_flags`**, find the line:
-   ```ini
+1. Open `platformio.ini` in the project root.
+2. In `[env:ttgo_t_display]` → `build_flags`, find the line:
+  ```ini
    -D OBD_BT_NAME=\"YourAdapterName\"
-   ```
+  ```
 3. Replace `YourAdapterName` with the **exact Bluetooth name** your phone or PC shows when scanning (case-sensitive in practice; the firmware uppercases responses but the initial pairing target is the name you configure here).
 4. **Optional — fixed MAC:** If multiple devices share similar names or pairing is flaky, set:
-   ```ini
+  ```ini
    -D OBD_BT_MAC=\"AA:BB:CC:DD:EE:FF\"
-   ```
+  ```
    Use your adapter’s real MAC (colons, uppercase hex is typical). You can leave `OBD_BT_MAC` as `\"\"` to connect by name only (see connection order in `src/main.cpp`).
 5. **Rebuild and re-flash** after any change (`pio run -e ttgo_t_display -t upload`).
 
@@ -44,7 +46,7 @@ Defaults in repo may still show a placeholder name (e.g. `V-LINK`); **you must s
 
 ## Build & upload
 
-Default environment: **`ttgo_t_display`** (board `esp32dev`, partition **`huge_app`** for firmware size).
+Default environment: `ttgo_t_display` (board `esp32dev`, partition `huge_app` for firmware size).
 
 ```bash
 pio run -e ttgo_t_display -t upload
@@ -58,25 +60,40 @@ pio device monitor -b 115200
 
 ## Configuration summary
 
-| `platformio.ini` define | Purpose |
-|-------------------------|---------|
-| `OBD_BT_NAME` | Bluetooth name of the ELM327 adapter (must match your dongle) |
-| `OBD_BT_MAC` | Optional fixed adapter MAC if name-only connect is unreliable |
+
+| `platformio.ini` define               | Purpose                                                                                         |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `OBD_BT_NAME`                         | Bluetooth name of the ELM327 adapter (must match your dongle)                                   |
+| `OBD_BT_MAC`                          | Optional fixed adapter MAC if name-only connect is unreliable                                   |
 | `BRIDGE_RPM_MS`, `BRIDGE_SPEED_MS`, … | PID request intervals in milliseconds (names are legacy; they only set poll timing in `src/main.cpp`) |
-| `BRIDGE_LIGHTS_MS` | How often to request PID `0x3E` for backlight logic (V1.1+, default 2000 ms) |
-| `OBD_LIGHTS_ON_MASK` | Bitmask applied to the `0x3E` payload (decimal, e.g. `1` = bit 0, `256` = bit 8). When `(raw & mask) != 0`, firmware treats exterior/lights as **on** and dims to 20%. |
+| `HUD_USE_BUTTON_BACKLIGHT`            | Default `1`: GPIO35 short-press cycles backlight **100% / 50% / 20%**.                          |
+| `HUD_BL_BUTTON_PIN`                   | GPIO for that button (default **35** = LilyGO **BUTTON1**).                                     |
+| `HUD_BL_BUTTON_ACTIVE_HIGH`           | Default `0` (pressed = LOW). Set to `1` if your board reads HIGH when pressed.                  |
+| `HUD_LEDC_WRITE_USES_GPIO_PIN`        | Usually auto from Arduino core: `0` = `ledcWrite(channel, …)` (core 2.x), `1` = `ledcWrite(GPIO, …)` (core 3.x). Set manually if backlight never changes after a core upgrade. |
+| `HUD_SERIAL_DEBUG_BACKLIGHT`          | Add this define (no value) to print GPIO / PWM lines on **Serial** at **115200** baud.        |
 
-Display pins and **TFT_eSPI** options for the TTGO board are also in **`platformio.ini`**.
 
-**Backlight hardware:** PWM on **`TFT_BL`** (pin **4** on this build). Requires `TFT_BL` defined in `platformio.ini` (already set for TTGO T-Display).
+Display pins and **TFT_eSPI** options for the TTGO board are also in `platformio.ini`.
+
+**Backlight:** PWM on **`TFT_BL`** (pin **4** on this build). Default **`HUD_BL_BUTTON_PIN`** is **35** (LilyGO **BUTTON1**): onboard pull-up to 3.3 V, **pressed = LOW**. If you use **BUTTON2**, set `HUD_BL_BUTTON_PIN=0` (note: holding **GPIO0** low at reset enters download mode). Requires `TFT_BL` in `platformio.ini` (already set for TTGO T-Display).
+
+### Backlight button: Serial Monitor (troubleshooting)
+
+1. Add to `build_flags` in `platformio.ini`: `-D HUD_SERIAL_DEBUG_BACKLIGHT`
+2. Rebuild, flash, open the serial monitor at **115200** baud.
+3. You should see a boot line with `TFT_BL`, button GPIO, and `ledc_writes_pin` vs `ledc_writes_channel`. Every ~400 ms: `GPIO35 raw=…` (0 = pressed on a typical board), `step`, and `duty`.
+4. If you press the **GPIO35** button and **`step` / `duty` never change** but `raw` toggles, note the `ledc_writes_*` line — after an **Arduino-ESP32 3.x** upgrade you may need `-D HUD_LEDC_WRITE_USES_GPIO_PIN=1` (or `0` if it was wrong).
+5. If **`raw` never changes** when you press either onboard key, try `-D HUD_BL_BUTTON_PIN=0` for **BUTTON2**, or `-D HUD_BL_BUTTON_ACTIVE_HIGH=1` if your hardware is inverted.
 
 ## Project layout
 
-| Path | Role |
-|------|------|
-| `src/main.cpp` | Bluetooth ELM327 client, OBD parsing, LVGL UI |
-| `include/lv_conf.h` | LVGL configuration and enabled fonts |
-| `images/elm_327_mini.png` | Reference image for documentation |
+
+| Path                      | Role                                          |
+| ------------------------- | --------------------------------------------- |
+| `src/main.cpp`            | Bluetooth ELM327 client, OBD parsing, LVGL UI |
+| `include/lv_conf.h`       | LVGL configuration and enabled fonts          |
+| `images/elm_327_mini.png` | Reference image for documentation             |
+
 
 ## Optional: offline OBD line check
 

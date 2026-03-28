@@ -3,7 +3,7 @@
  * Display: ST7789 135x240, rotation 1 => 240x135 landscape.
  * Driver: TFT_eSPI + LVGL 9 (partial double-buffer, no full-frame flicker).
  *
- * Firmware: V1.1 — OBD-driven backlight dim (PID 0x3E); V1.00 baseline had fixed brightness.
+ * Firmware: V1.1 — onboard GPIO35 button cycles backlight (100% / 50% / 20%).
  */
 
 #include <Arduino.h>
@@ -34,6 +34,30 @@
 #endif
 #ifndef OBD_LIGHTS_ON_MASK
 #define OBD_LIGHTS_ON_MASK 0x0001u
+#endif
+
+/* 1 = cycle backlight via HUD_BL_BUTTON_PIN. 0 = other logic in this file (no GPIO button polling). */
+#ifndef HUD_USE_BUTTON_BACKLIGHT
+#define HUD_USE_BUTTON_BACKLIGHT 1
+#endif
+#ifndef HUD_BL_BUTTON_PIN
+#define HUD_BL_BUTTON_PIN 35
+#endif
+/* 0 = LilyGO default (released = HIGH, pressed = LOW). 1 = pressed reads HIGH. */
+#ifndef HUD_BL_BUTTON_ACTIVE_HIGH
+#define HUD_BL_BUTTON_ACTIVE_HIGH 0
+#endif
+/*
+ * Arduino-ESP32 2.x: ledcWrite(channel, duty) after ledcAttachPin(gpio, channel).
+ * Arduino-ESP32 3.x: ledcWrite(gpio, duty). Using the wrong form leaves TFT_BL stuck at one level.
+ * Override with -D HUD_LEDC_WRITE_USES_GPIO_PIN=0|1 if auto-detect is wrong.
+ */
+#ifndef HUD_LEDC_WRITE_USES_GPIO_PIN
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+#define HUD_LEDC_WRITE_USES_GPIO_PIN 1
+#else
+#define HUD_LEDC_WRITE_USES_GPIO_PIN 0
+#endif
 #endif
 
 /* Top bar visual max (real RPM can exceed; bar pegs at this value) */
@@ -71,6 +95,9 @@ static uint32_t lastFast = 0;
 static uint32_t lastMedium = 0;
 static uint32_t lastSlow = 0;
 static uint32_t lastVolt = 0;
+#if !HUD_USE_BUTTON_BACKLIGHT
+static uint32_t lastLights = 0;
+#endif
 static uint32_t lastReconnectTry = 0;
 
 static int displayRpm = 0;
@@ -83,8 +110,6 @@ static bool haveVoltage = false;
 /* PID 0x3E auxiliary I/O — bit(s) set => “lights on” for backlight dim (vehicle-specific) */
 static bool g_obd_lights_valid = false;
 static bool g_obd_lights_on = false;
-static uint32_t lastLights = 0;
-
 /* FontAwesome trong Montserrat không có thermometer (f2c9); LV_SYMBOL_TINT (giọt) nằm trong glyph set */
 #define HUD_SYM_COOLANT LV_SYMBOL_TINT
 
@@ -94,12 +119,21 @@ static constexpr uint32_t kBlPwmFreq = 12000;
 static constexpr uint8_t kBlPwmBits = 8;
 static uint8_t g_bl_duty_applied = 0xFF;
 
+static void hud_ledc_write_bl(uint8_t duty)
+{
+#if HUD_LEDC_WRITE_USES_GPIO_PIN
+  ledcWrite((uint8_t)TFT_BL, duty);
+#else
+  ledcWrite(kBlPwmChannel, duty);
+#endif
+}
+
 static void backlight_pwm_init()
 {
   ledcSetup(kBlPwmChannel, kBlPwmFreq, kBlPwmBits);
   ledcAttachPin(TFT_BL, kBlPwmChannel);
   g_bl_duty_applied = 0xFE; /* force first write */
-  ledcWrite(kBlPwmChannel, 255);
+  hud_ledc_write_bl(255);
   g_bl_duty_applied = 255;
 }
 
@@ -108,13 +142,70 @@ static void backlight_set_duty8(uint8_t duty)
   if (duty == g_bl_duty_applied)
     return;
   g_bl_duty_applied = duty;
-  ledcWrite(kBlPwmChannel, duty);
+  hud_ledc_write_bl(duty);
+#ifdef HUD_SERIAL_DEBUG_BACKLIGHT
+  Serial.printf("[BL] PWM duty=%u (ledc arg=%s TFT_BL=%d)\n", (unsigned)duty,
+                HUD_LEDC_WRITE_USES_GPIO_PIN ? "GPIO pin" : "channel", (int)TFT_BL);
+#endif
+}
+#endif
+
+#if HUD_USE_BUTTON_BACKLIGHT && defined(TFT_BL)
+/* LilyGO: BUTTON1 = GPIO35, BUTTON2 = GPIO0 (README pin table). */
+static constexpr uint8_t kHudBlDutySteps[] = {
+    255,
+    (uint8_t)(255U * 50U / 100U),
+    (uint8_t)(255U * 20U / 100U),
+};
+static uint8_t g_hud_bl_step = 0;
+static bool g_hud_btn_sample = true;
+static bool g_hud_btn_stable_high = true;
+static uint32_t g_hud_btn_last_change_ms = 0;
+#ifdef HUD_SERIAL_DEBUG_BACKLIGHT
+static uint32_t g_hud_bl_dbg_log_ms = 0;
+#endif
+
+static void hud_backlight_button_poll()
+{
+  const int pin_raw = digitalRead(HUD_BL_BUTTON_PIN);
+#if HUD_BL_BUTTON_ACTIVE_HIGH
+  const bool sample_high = (pin_raw == LOW); /* released */
+#else
+  const bool sample_high = (pin_raw == HIGH);
+#endif
+  const uint32_t now = millis();
+#ifdef HUD_SERIAL_DEBUG_BACKLIGHT
+  if (now - g_hud_bl_dbg_log_ms >= 400)
+  {
+    g_hud_bl_dbg_log_ms = now;
+    Serial.printf("[BL] GPIO%d raw=%d released=%u step=%u duty=%u\n", HUD_BL_BUTTON_PIN, pin_raw,
+                  (unsigned)sample_high, (unsigned)g_hud_bl_step, (unsigned)g_bl_duty_applied);
+  }
+#endif
+  if (sample_high != g_hud_btn_sample)
+  {
+    g_hud_btn_sample = sample_high;
+    g_hud_btn_last_change_ms = now;
+  }
+  if (now - g_hud_btn_last_change_ms < 45)
+    return;
+  const bool stable_high = sample_high;
+  if (!stable_high && g_hud_btn_stable_high)
+  {
+    g_hud_bl_step = (uint8_t)((g_hud_bl_step + 1) % (sizeof(kHudBlDutySteps) / sizeof(kHudBlDutySteps[0])));
+    backlight_set_duty8(kHudBlDutySteps[g_hud_bl_step]);
+#ifdef HUD_SERIAL_DEBUG_BACKLIGHT
+    Serial.printf("[BL] step -> %u\n", (unsigned)g_hud_bl_step);
+#endif
+  }
+  g_hud_btn_stable_high = stable_high;
 }
 #endif
 
 /* Lights on (night) => 20%; off or PID never seen => 100% */
 static void backlight_apply_obd_policy()
 {
+#if !HUD_USE_BUTTON_BACKLIGHT
 #ifdef TFT_BL
   if (!g_obd_lights_valid)
     backlight_set_duty8(255);
@@ -123,13 +214,18 @@ static void backlight_apply_obd_policy()
   else
     backlight_set_duty8(255);
 #endif
+#endif
 }
 
 static void apply_obd_aux_lights_raw(uint16_t raw)
 {
+#if !HUD_USE_BUTTON_BACKLIGHT
   g_obd_lights_valid = true;
   g_obd_lights_on = (raw & (uint16_t)OBD_LIGHTS_ON_MASK) != 0;
   backlight_apply_obd_policy();
+#else
+  (void)raw;
+#endif
 }
 
 static void obd_lights_reset()
@@ -547,7 +643,10 @@ static void initElm()
   delay(300);
   obdReady = true;
   obd_lights_reset();
-  lastFast = lastMedium = lastSlow = lastVolt = lastLights = millis();
+  lastFast = lastMedium = lastSlow = lastVolt = millis();
+#if !HUD_USE_BUTTON_BACKLIGHT
+  lastLights = millis();
+#endif
 }
 
 static void sync_ui_from_obd()
@@ -564,6 +663,17 @@ void setup()
 {
   Serial.begin(115200);
   delay(150);
+#ifdef HUD_SERIAL_DEBUG_BACKLIGHT
+  Serial.println();
+  Serial.printf("HUD_SERIAL_DEBUG_BACKLIGHT TFT_BL=%d btn GPIO%d active_high=%d ledc_writes_%s\n",
+#ifdef TFT_BL
+                (int)TFT_BL,
+#else
+                -1,
+#endif
+                HUD_BL_BUTTON_PIN, (int)HUD_BL_BUTTON_ACTIVE_HIGH,
+                HUD_LEDC_WRITE_USES_GPIO_PIN ? "pin" : "channel");
+#endif
 
   tft.init();
   tft.setRotation(1);
@@ -571,6 +681,9 @@ void setup()
   tft.setSwapBytes(true);
 #ifdef TFT_BL
   backlight_pwm_init();
+#endif
+#if HUD_USE_BUTTON_BACKLIGHT
+  pinMode(HUD_BL_BUTTON_PIN, INPUT);
 #endif
   tft.fillScreen(TFT_BLACK);
 
@@ -588,6 +701,9 @@ void setup()
 
 void loop()
 {
+#if HUD_USE_BUTTON_BACKLIGHT && defined(TFT_BL)
+  hud_backlight_button_poll();
+#endif
   const bool btOk = SerialBT.connected();
   update_status(btOk);
 
@@ -650,11 +766,13 @@ void loop()
     sendElm("0142");
   }
 
+#if !HUD_USE_BUTTON_BACKLIGHT
   if (now - lastLights >= BRIDGE_LIGHTS_MS)
   {
     lastLights = now;
     sendElm("013E");
   }
+#endif
 
   sync_ui_from_obd();
   lv_timer_handler();
