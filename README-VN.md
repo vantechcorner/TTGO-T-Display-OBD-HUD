@@ -2,7 +2,7 @@
 
 > **Bản dịch của [README.md](README.md)** (tiếng Anh). Khi README gốc được sửa, file này nên được cập nhật tương ứng.
 
-Firmware cho **LilyGO TTGO T-Display** (ESP32, ST7789 135×240, USB‑C): kết nối **Bluetooth Classic** tới adapter **ELM327** OBD-II và hiển thị bảng điều khiển **LVGL 9** (tốc độ quay máy, vận tốc, nhiệt độ làm mát, điện áp ắc quy). **V1.1** chỉnh độ sáng đèn nền bằng **nút GPIO35** trên board (100% / 50% / 20%). Với **`HUD_USE_BUTTON_BACKLIGHT=0`**, đèn nền giữ **mức PWM lúc khởi động** (thường là sáng tối đa) và firmware **không** đọc nút.
+Firmware cho **LilyGO TTGO T-Display** (ESP32, ST7789 135×240, USB‑C): kết nối **Bluetooth Classic** tới adapter **ELM327** OBD-II và hiển thị bảng điều khiển **LVGL 9** (tốc độ quay máy, vận tốc, nhiệt độ làm mát, điện áp ắc quy). **V1.2** có **tùy chọn khi build để đổi vị trí RPM và tốc độ** trên màn hình (xem **`HUD_SWAP_RPM_SPEED_LAYOUT`**). Đèn nền vẫn chỉnh bằng **nút GPIO35** (100% / 50% / 20%), được đọc trên **task FreeRTOS riêng** nên vẫn hoạt động khi Bluetooth đang chờ kết nối lâu và **`loop()`** bị chặn. Với **`HUD_USE_BUTTON_BACKLIGHT=0`**, đèn nền giữ **mức PWM lúc khởi động** (thường là sáng tối đa) và firmware **không** đọc nút.
 
 ### Phiên bản firmware
 
@@ -11,6 +11,7 @@ Firmware cho **LilyGO TTGO T-Display** (ESP32, ST7789 135×240, USB‑C): kết 
 | --------- | --------------------------------------------------------------------------------------------- |
 | **V1.0**  | Nền tảng ổn định: đèn nền cố định, giao diện đầy đủ thông số.                                |
 | **V1.1**  | **Nút điều chỉnh đèn nền:** nhấn ngắn **BUTTON1 (GPIO35)** để chuyển PWM **100% → 50% → 20% → 100%** (chống dội). Bảng chân LilyGO: **BUTTON1 = 35**, **BUTTON2 = 0** ([pinmap](https://raw.githubusercontent.com/Xinyuan-LilyGO/TTGO-T-Display/master/image/pinmap.jpg)). |
+| **V1.2**  | **Bố cục:** bật **`HUD_SWAP_RPM_SPEED_LAYOUT=1`** để **tốc độ số lớn ở giữa** kèm chữ **`km/h`** nhỏ, **RPM** (có nhãn **`RPM`**) **dưới trái**; **thanh RPM** giữ nguyên. Cần font **Montserrat 28** trong `lv_conf.h` (repo đã bật). **Đèn nền:** đọc GPIO35 trên **core 0** để bước sáng và log **`HUD_SERIAL_DEBUG_BACKLIGHT`** không bị đứng hàng chục giây khi **`SerialBT.connect()`** chờ; in debug **không chặn TX** khi buffer UART USB đầy. |
 
 
 ## Adapter đã thử (cấu hình tham chiếu)
@@ -91,11 +92,12 @@ Khi sửa **README.md** (tiếng Anh), hãy cập nhật **[README-VN.md](README
 | `HUD_BL_BUTTON_ACTIVE_HIGH`| Mặc định `0` (nhấn = LOW). Đặt `1` nếu nhấn đọc HIGH.                                       |
 | `HUD_LEDC_WRITE_USES_GPIO_PIN` | Thường tự nhận theo Arduino core: `0` = `ledcWrite(channel, …)` (core 2.x), `1` = `ledcWrite(GPIO, …)` (core 3.x). Chỉnh tay nếu sau nâng core đèn nền không đổi. |
 | `HUD_SERIAL_DEBUG_BACKLIGHT` | Thêm define (không giá trị) để in dòng GPIO/PWM lên **Serial** 115200 baud.                 |
+| `HUD_SWAP_RPM_SPEED_LAYOUT`  | Mặc định `0`. Đặt `1`: **tốc độ** căn giữa — **số lớn + chữ `km/h` nhỏ** (hàng flex); **RPM** **dưới trái** — **số font 28 + chữ `RPM` nhỏ**. **Thanh RPM** không đổi. |
 
 
 Chân màn hình và tùy chọn **TFT_eSPI** cho board TTGO cũng nằm trong `platformio.ini`.
 
-**Đèn nền:** PWM trên **`TFT_BL`** (chân **4** trong bản build này). Mặc định **`HUD_BL_BUTTON_PIN`** là **35** (**BUTTON1**): pull-up 3,3 V, **nhấn = LOW**. Dùng **BUTTON2** thì đặt `HUD_BL_BUTTON_PIN=0` (lưu ý: giữ **GPIO0** thấp lúc reset sẽ vào chế độ download). Cần có `TFT_BL` trong `platformio.ini` (đã bật cho TTGO T-Display).
+**Đèn nền:** PWM trên **`TFT_BL`** (chân **4** trong bản build này). Mặc định **`HUD_BL_BUTTON_PIN`** là **35** (**BUTTON1**): pull-up 3,3 V, **nhấn = LOW**. Dùng **BUTTON2** thì đặt `HUD_BL_BUTTON_PIN=0` (lưu ý: giữ **GPIO0** thấp lúc reset sẽ vào chế độ download). Cần có `TFT_BL` trong `platformio.ini` (đã bật cho TTGO T-Display). Sau khi khởi tạo **LVGL** và **Bluetooth**, firmware **gắn lại LEDC** trên `TFT_BL` để chân không bị kẹt ở chế độ GPIO thường. Nếu nhấn nút mà độ sáng vẫn không đổi, hãy thử đảo **`HUD_LEDC_WRITE_USES_GPIO_PIN`** (`0` / `1`) cho đúng core Arduino-ESP32 của bạn.
 
 ### Nút đèn nền: Serial Monitor (xử lý sự cố)
 
@@ -104,6 +106,7 @@ Chân màn hình và tùy chọn **TFT_eSPI** cho board TTGO cũng nằm trong `
 3. Sẽ thấy dòng khởi động với `TFT_BL`, GPIO nút, và `ledc_writes_pin` hay `ledc_writes_channel`. Khoảng mỗi 400 ms: `GPIO35 raw=…` (0 = đang nhấn trên board điển hình), `step`, `duty`.
 4. Nếu nhấn **GPIO35** mà **`step` / `duty` không đổi** nhưng `raw` đảo — xem dòng `ledc_writes_*`; sau khi lên **Arduino-ESP32 3.x** có thể cần `-D HUD_LEDC_WRITE_USES_GPIO_PIN=1` (hoặc `0` nếu trước đó sai).
 5. Nếu **`raw` không đổi** khi nhấn hai nút trên board, thử `-D HUD_BL_BUTTON_PIN=0` cho **BUTTON2**, hoặc `-D HUD_BL_BUTTON_ACTIVE_HIGH=1` nếu phần cứng đảo mức.
+6. Nếu **`raw` luôn là `1` và `released=1`** dù bạn đang nhấn **BUTTON1**, vi điều khiển **không bao giờ thấy mức LOW** trên chân đó (sai chân, nút hỏng, hoặc board clone thiếu pull-up ngoài trên **GPIO35** — ESP32 **không** bật được pull-up nội cho GPIO **34–39**). Hãy thử **`HUD_BL_BUTTON_PIN=0`** (nút kia; đừng giữ thấp lúc reset), đối chiếu [pinmap LilyGO](https://raw.githubusercontent.com/Xinyuan-LilyGO/TTGO-T-Display/master/image/pinmap.jpg), hoặc hàn **10kΩ lên 3,3V** nếu chân đang “trôi”.
 
 ### Serial: `ASSERT_WARN(… lc_task.c …)` lúc khởi động
 

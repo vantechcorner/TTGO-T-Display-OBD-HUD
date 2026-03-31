@@ -3,15 +3,21 @@
  * Display: ST7789 135x240, rotation 1 => 240x135 landscape.
  * Driver: TFT_eSPI + LVGL 9 (partial double-buffer, no full-frame flicker).
  *
- * Firmware: V1.1 — onboard GPIO35 short-press cycles backlight (100% / 50% / 20%).
+ * Firmware: V1.2 — optional RPM/speed layout swap (HUD_SWAP_RPM_SPEED_LAYOUT); GPIO35 backlight
+ * cycling (100% / 50% / 20%) polled on a core-0 task so BT connect does not block the button.
  */
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <stdio.h>
 #include <string.h>
 #include <BluetoothSerial.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
+#ifdef HUD_SERIAL_DEBUG_BACKLIGHT
+#include <stdarg.h>
+#endif
 
 #ifndef OBD_BT_MAC
 #define OBD_BT_MAC ""
@@ -63,6 +69,10 @@
 #ifndef RPM_LABEL_MAX
 #define RPM_LABEL_MAX 9999
 #endif
+/* 1 = speed as large center readout, RPM smaller bottom-left (swap vs default). */
+#ifndef HUD_SWAP_RPM_SPEED_LAYOUT
+#define HUD_SWAP_RPM_SPEED_LAYOUT 0
+#endif
 
 /* --- Display / LVGL --- */
 static constexpr uint16_t TFTW = 240;
@@ -78,6 +88,10 @@ static lv_color_t g_buf2[TFTW * 28];
 static lv_obj_t *g_rpm_bar;
 static lv_obj_t *g_lbl_rpm;
 static lv_obj_t *g_lbl_speed;
+#if HUD_SWAP_RPM_SPEED_LAYOUT
+static lv_obj_t *g_lbl_speed_kmh;
+static lv_obj_t *g_lbl_rpm_unit;
+#endif
 static lv_obj_t *g_lbl_temp;
 static lv_obj_t *g_lbl_volt;
 static lv_obj_t *g_lbl_bt;
@@ -103,6 +117,25 @@ static bool haveVoltage = false;
 /* FontAwesome trong Montserrat không có thermometer (f2c9); LV_SYMBOL_TINT (giọt) nằm trong glyph set */
 #define HUD_SYM_COOLANT LV_SYMBOL_TINT
 
+#ifdef HUD_SERIAL_DEBUG_BACKLIGHT
+/* Serial.printf can block a long time when the USB-UART TX buffer is full; loop() then never
+ * finishes and the backlight button poll stops. Only emit when there is FIFO space. */
+static bool hud_bl_dbg_emitf(const char *fmt, ...)
+{
+  char buf[160];
+  va_list ap;
+  va_start(ap, fmt);
+  const int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (n <= 0 || n >= (int)sizeof(buf))
+    return false;
+  if (Serial.availableForWrite() < n + 24)
+    return false;
+  Serial.write(reinterpret_cast<const uint8_t *>(buf), static_cast<size_t>(n));
+  return true;
+}
+#endif
+
 #ifdef TFT_BL
 static constexpr uint8_t kBlPwmChannel = 5;
 static constexpr uint32_t kBlPwmFreq = 12000;
@@ -127,6 +160,14 @@ static void backlight_pwm_init()
   g_bl_duty_applied = 255;
 }
 
+/* LVGL / BT init can leave TFT_BL back in GPIO mode; re-run LEDC attach before polling the button. */
+static void backlight_pwm_reassert(void)
+{
+  ledcSetup(kBlPwmChannel, kBlPwmFreq, kBlPwmBits);
+  ledcAttachPin(TFT_BL, kBlPwmChannel);
+  hud_ledc_write_bl(g_bl_duty_applied);
+}
+
 static void backlight_set_duty8(uint8_t duty)
 {
   if (duty == g_bl_duty_applied)
@@ -134,8 +175,8 @@ static void backlight_set_duty8(uint8_t duty)
   g_bl_duty_applied = duty;
   hud_ledc_write_bl(duty);
 #ifdef HUD_SERIAL_DEBUG_BACKLIGHT
-  Serial.printf("[BL] PWM duty=%u (ledc arg=%s TFT_BL=%d)\n", (unsigned)duty,
-                HUD_LEDC_WRITE_USES_GPIO_PIN ? "GPIO pin" : "channel", (int)TFT_BL);
+  (void)hud_bl_dbg_emitf("[BL] PWM duty=%u (ledc arg=%s TFT_BL=%d)\n", (unsigned)duty,
+                         HUD_LEDC_WRITE_USES_GPIO_PIN ? "GPIO pin" : "channel", (int)TFT_BL);
 #endif
 }
 #endif
@@ -155,21 +196,37 @@ static uint32_t g_hud_btn_last_change_ms = 0;
 static uint32_t g_hud_bl_dbg_log_ms = 0;
 #endif
 
+static bool hud_bl_pin_raw_pressed(int r)
+{
+#if HUD_BL_BUTTON_ACTIVE_HIGH
+  return (r == HIGH);
+#else
+  return (r == LOW);
+#endif
+}
+
+/* Two consecutive reads agree: cheap glitch filter without delayMicroseconds in loop(). */
+static bool hud_bl_button_pressed_filtered(int *first_raw_out)
+{
+  const int a = digitalRead(HUD_BL_BUTTON_PIN);
+  if (first_raw_out)
+    *first_raw_out = a;
+  const int b = digitalRead(HUD_BL_BUTTON_PIN);
+  return hud_bl_pin_raw_pressed(a) && hud_bl_pin_raw_pressed(b);
+}
+
 static void hud_backlight_button_poll()
 {
-  const int pin_raw = digitalRead(HUD_BL_BUTTON_PIN);
-#if HUD_BL_BUTTON_ACTIVE_HIGH
-  const bool sample_high = (pin_raw == LOW); /* released */
-#else
-  const bool sample_high = (pin_raw == HIGH);
-#endif
+  int pin_raw = 0;
+  const bool pressed_f = hud_bl_button_pressed_filtered(&pin_raw);
+  const bool sample_high = !pressed_f; /* released (not pressed) */
   const uint32_t now = millis();
 #ifdef HUD_SERIAL_DEBUG_BACKLIGHT
   if (now - g_hud_bl_dbg_log_ms >= 400)
   {
-    g_hud_bl_dbg_log_ms = now;
-    Serial.printf("[BL] GPIO%d raw=%d released=%u step=%u duty=%u\n", HUD_BL_BUTTON_PIN, pin_raw,
-                  (unsigned)sample_high, (unsigned)g_hud_bl_step, (unsigned)g_bl_duty_applied);
+    if (hud_bl_dbg_emitf("[BL] GPIO%d raw=%d released=%u step=%u duty=%u\n", HUD_BL_BUTTON_PIN, pin_raw,
+                         (unsigned)sample_high, (unsigned)g_hud_bl_step, (unsigned)g_bl_duty_applied))
+      g_hud_bl_dbg_log_ms = now;
   }
 #endif
   if (sample_high != g_hud_btn_sample)
@@ -177,7 +234,7 @@ static void hud_backlight_button_poll()
     g_hud_btn_sample = sample_high;
     g_hud_btn_last_change_ms = now;
   }
-  if (now - g_hud_btn_last_change_ms < 45)
+  if (now - g_hud_btn_last_change_ms < 25)
     return;
   const bool stable_high = sample_high;
   if (!stable_high && g_hud_btn_stable_high)
@@ -185,10 +242,32 @@ static void hud_backlight_button_poll()
     g_hud_bl_step = (uint8_t)((g_hud_bl_step + 1) % (sizeof(kHudBlDutySteps) / sizeof(kHudBlDutySteps[0])));
     backlight_set_duty8(kHudBlDutySteps[g_hud_bl_step]);
 #ifdef HUD_SERIAL_DEBUG_BACKLIGHT
-    Serial.printf("[BL] step -> %u\n", (unsigned)g_hud_bl_step);
+    (void)hud_bl_dbg_emitf("[BL] step -> %u\n", (unsigned)g_hud_bl_step);
 #endif
   }
   g_hud_btn_stable_high = stable_high;
+}
+
+/* SerialBT.connect() and initElm() delay() block loop() for tens of seconds; Arduino loop() runs on
+ * core 1, so a small task on core 0 keeps backlight button polling alive during BT connect. */
+static void hud_backlight_poll_task(void * /*arg*/)
+{
+  for (;;)
+  {
+    hud_backlight_button_poll();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+static void hud_backlight_poll_task_start()
+{
+  constexpr UBaseType_t kPrio = 1;
+  constexpr uint32_t kStackWords = 3072;
+  if (xTaskCreatePinnedToCore(hud_backlight_poll_task, "hud_bl", kStackWords, nullptr, kPrio, nullptr, 0) !=
+      pdPASS)
+  {
+    /* Unlikely; fallback is loop()-only poll (backlight may freeze during BT connect). */
+  }
 }
 #endif
 
@@ -272,7 +351,11 @@ void update_speed(int value)
     value = 0;
   if (value > 999)
     value = 999;
+#if HUD_SWAP_RPM_SPEED_LAYOUT
+  lv_label_set_text_fmt(g_lbl_speed, "%d", value);
+#else
   lv_label_set_text_fmt(g_lbl_speed, "%d km/h", value);
+#endif
 }
 
 void update_temp(int value)
@@ -367,6 +450,70 @@ static void build_ui()
   lv_obj_align(g_rpm_bar, LV_ALIGN_TOP_MID, 0, 26);
   lv_bar_set_value(g_rpm_bar, 0, LV_ANIM_OFF);
 
+#if HUD_SWAP_RPM_SPEED_LAYOUT
+  /* Speed — center: large value + small "km/h", whole block centered (flex row) */
+  {
+    lv_obj_t *speed_row = lv_obj_create(scr);
+    lv_obj_remove_style_all(speed_row);
+    lv_obj_set_style_bg_opa(speed_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_column(speed_row, 5, 0);
+    lv_obj_set_layout(speed_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(speed_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(speed_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(speed_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(speed_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_width(speed_row, LV_SIZE_CONTENT);
+    lv_obj_set_height(speed_row, LV_SIZE_CONTENT);
+
+    g_lbl_speed = lv_label_create(speed_row);
+    lv_label_set_text_static(g_lbl_speed, "0");
+    lv_obj_set_style_text_font(g_lbl_speed, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(g_lbl_speed, lv_color_hex(0xF5F8FF), 0);
+    lv_obj_set_style_text_letter_space(g_lbl_speed, 1, 0);
+    lv_obj_clear_flag(g_lbl_speed, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(g_lbl_speed, LV_OBJ_FLAG_CLICKABLE);
+
+    g_lbl_speed_kmh = lv_label_create(speed_row);
+    lv_label_set_text_static(g_lbl_speed_kmh, "km/h");
+    lv_obj_set_style_text_font(g_lbl_speed_kmh, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(g_lbl_speed_kmh, lv_color_hex(0x98A8C0), 0);
+    lv_obj_clear_flag(g_lbl_speed_kmh, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(g_lbl_speed_kmh, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_align(speed_row, LV_ALIGN_CENTER, 0, 4);
+  }
+
+  /* RPM — bottom left: slightly larger value + small "RPM"; bar above still tracks RPM */
+  {
+    lv_obj_t *rpm_row = lv_obj_create(scr);
+    lv_obj_remove_style_all(rpm_row);
+    lv_obj_set_style_bg_opa(rpm_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_column(rpm_row, 4, 0);
+    lv_obj_set_layout(rpm_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(rpm_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(rpm_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(rpm_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(rpm_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_width(rpm_row, LV_SIZE_CONTENT);
+    lv_obj_set_height(rpm_row, LV_SIZE_CONTENT);
+
+    g_lbl_rpm = lv_label_create(rpm_row);
+    lv_label_set_text_static(g_lbl_rpm, "0");
+    lv_obj_set_style_text_font(g_lbl_rpm, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(g_lbl_rpm, lv_color_hex(0xB8C8E0), 0);
+    lv_obj_clear_flag(g_lbl_rpm, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(g_lbl_rpm, LV_OBJ_FLAG_CLICKABLE);
+
+    g_lbl_rpm_unit = lv_label_create(rpm_row);
+    lv_label_set_text_static(g_lbl_rpm_unit, "RPM");
+    lv_obj_set_style_text_font(g_lbl_rpm_unit, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(g_lbl_rpm_unit, lv_color_hex(0x8899AA), 0);
+    lv_obj_clear_flag(g_lbl_rpm_unit, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(g_lbl_rpm_unit, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_align(rpm_row, LV_ALIGN_BOTTOM_LEFT, 6, -6);
+  }
+#else
   /* RPM numeric — center, largest font */
   g_lbl_rpm = lv_label_create(scr);
   lv_label_set_text_static(g_lbl_rpm, "0");
@@ -381,6 +528,7 @@ static void build_ui()
   lv_obj_set_style_text_font(g_lbl_speed, &lv_font_montserrat_24, 0);
   lv_obj_set_style_text_color(g_lbl_speed, lv_color_hex(0xB8C8E0), 0);
   lv_obj_align(g_lbl_speed, LV_ALIGN_BOTTOM_LEFT, 6, -6);
+#endif
 
   /* BT hint — text only (see update_status: avoid lv_obj circle) */
   g_lbl_bt = lv_label_create(scr);
@@ -596,18 +744,22 @@ static void sync_ui_from_obd()
 
 void setup()
 {
+#ifdef HUD_SERIAL_DEBUG_BACKLIGHT
+  Serial.setTxBufferSize(1024);
+#endif
   Serial.begin(115200);
   delay(150);
 #ifdef HUD_SERIAL_DEBUG_BACKLIGHT
   Serial.println();
-  Serial.printf("HUD_SERIAL_DEBUG_BACKLIGHT TFT_BL=%d btn GPIO%d active_high=%d ledc_writes_%s\n",
+  (void)hud_bl_dbg_emitf(
+      "HUD_SERIAL_DEBUG_BACKLIGHT TFT_BL=%d btn GPIO%d active_high=%d ledc_writes_%s\n",
 #ifdef TFT_BL
-                (int)TFT_BL,
+      (int)TFT_BL,
 #else
-                -1,
+      -1,
 #endif
-                HUD_BL_BUTTON_PIN, (int)HUD_BL_BUTTON_ACTIVE_HIGH,
-                HUD_LEDC_WRITE_USES_GPIO_PIN ? "pin" : "channel");
+      HUD_BL_BUTTON_PIN, (int)HUD_BL_BUTTON_ACTIVE_HIGH,
+      HUD_LEDC_WRITE_USES_GPIO_PIN ? "pin" : "channel");
 #endif
 
   tft.init();
@@ -618,11 +770,16 @@ void setup()
   backlight_pwm_init();
 #endif
 #if HUD_USE_BUTTON_BACKLIGHT
+  /* Before TFT/LVGL heavy init — same order as original V1.1 (late pinMode broke reads on some boards). */
   pinMode(HUD_BL_BUTTON_PIN, INPUT);
 #endif
   tft.fillScreen(TFT_BLACK);
 
   init_lvgl();
+
+#ifdef TFT_BL
+  backlight_pwm_reassert();
+#endif
 
   if (!SerialBT.begin("TTGO-OBD", true))
   {
@@ -632,13 +789,16 @@ void setup()
     while (true)
       delay(500);
   }
+#if HUD_USE_BUTTON_BACKLIGHT && defined(TFT_BL)
+  hud_backlight_poll_task_start();
+#endif
+#ifdef TFT_BL
+  backlight_pwm_reassert();
+#endif
 }
 
 void loop()
 {
-#if HUD_USE_BUTTON_BACKLIGHT && defined(TFT_BL)
-  hud_backlight_button_poll();
-#endif
   const bool btOk = SerialBT.connected();
   update_status(btOk);
 
