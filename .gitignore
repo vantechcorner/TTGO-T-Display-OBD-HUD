@@ -8,6 +8,9 @@
 .vscode/launch.json
 .vscode/ipch
 
+# Cursor IDE (local rules, MCP, caches — do not publish)
+.cursor/
+
 # Local scratch (serial captures, one-off logs)
 test/*-log.txt
 test/*.log
