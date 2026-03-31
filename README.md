@@ -1,6 +1,8 @@
 # TTGO T-Display OBD HUD
 
-Firmware for the **LilyGO TTGO T-Display** (ESP32, ST7789 135×240, USB‑C): connects over **Bluetooth Classic** to an **ELM327** OBD-II adapter and draws a **LVGL 9** dashboard (RPM, speed, coolant temperature, battery voltage). Backlight brightness is adjusted with the **onboard GPIO35 button** (V1.1).
+**[Thông tin & Hướng dẫn bằng tiếng Việt - Nhấn vào đây](README-VN.md)**
+
+Firmware for the **LilyGO TTGO T-Display** (ESP32, ST7789 135×240, USB‑C): connects over **Bluetooth Classic** to an **ELM327** OBD-II adapter and draws a **LVGL 9** dashboard (RPM, speed, coolant temperature, battery voltage). **V1.1** adjusts backlight with the **onboard GPIO35 button** (100% / 50% / 20%). With **`HUD_USE_BUTTON_BACKLIGHT=0`**, the backlight stays at the **PWM level from boot** (typically full brightness) and the button is not polled.
 
 ### Firmware versions
 
@@ -48,6 +50,20 @@ Defaults in repo may still show a placeholder name (e.g. `V-LINK`); **you must s
 
 Default environment: `ttgo_t_display` (board `esp32dev`, partition `huge_app` for firmware size).
 
+### Using VS Code
+
+1. Install [Visual Studio Code](https://code.visualstudio.com/).
+2. Open the Extensions view (**Ctrl+Shift+X** / **Cmd+Shift+X**), search for **PlatformIO IDE**, install it, then **reload** the window when prompted (first launch may download the PlatformIO Core / toolchains — wait until the status bar shows PlatformIO is ready).
+3. **File → Open Folder…** and select the project root (the folder that contains `platformio.ini`).
+4. Wait for PlatformIO to finish indexing; confirm the active environment is **`ttgo_t_display`** (project environments appear in the PlatformIO toolbar at the bottom of the window — pick `ttgo_t_display` if multiple are listed).
+5. **Build:** PlatformIO icon in the left activity bar → **PROJECT TASKS** → **ttgo_t_display** → **General** → **Build**, or use the **checkmark** (“PlatformIO: Build”) in the bottom status bar.
+6. **Upload:** Connect the board via USB, then **General** → **Upload**, or the **arrow** (“PlatformIO: Upload”) in the status bar. Put the board in download mode if your cable/driver requires it (TTGO T-Display usually uploads without extra buttons).
+7. **Serial monitor:** **General** → **Monitor**, or the **plug** icon (“PlatformIO: Serial Monitor”) — default baud **115200** is set in `platformio.ini`.
+
+If **Upload** or **Monitor** fails, install the USB-UART driver for your OS (CP210x or CH340, depending on the board) and choose the correct COM port under **PlatformIO: Upload Port** / device list.
+
+### Command line (CLI)
+
 ```bash
 pio run -e ttgo_t_display -t upload
 ```
@@ -58,6 +74,10 @@ Serial monitor (115200 baud):
 pio device monitor -b 115200
 ```
 
+### Maintainer note (documentation)
+
+When you change this **README.md**, update **[README-VN.md](README-VN.md)** so the Vietnamese guide stays aligned.
+
 ## Configuration summary
 
 
@@ -66,7 +86,7 @@ pio device monitor -b 115200
 | `OBD_BT_NAME`                         | Bluetooth name of the ELM327 adapter (must match your dongle)                                   |
 | `OBD_BT_MAC`                          | Optional fixed adapter MAC if name-only connect is unreliable                                   |
 | `BRIDGE_RPM_MS`, `BRIDGE_SPEED_MS`, … | PID request intervals in milliseconds (names are legacy; they only set poll timing in `src/main.cpp`) |
-| `HUD_USE_BUTTON_BACKLIGHT`            | Default `1`: GPIO35 short-press cycles backlight **100% / 50% / 20%**.                          |
+| `HUD_USE_BUTTON_BACKLIGHT`            | Default `1`: GPIO35 short-press cycles backlight **100% / 50% / 20%**. Set `0` to disable button polling; backlight stays at boot level. |
 | `HUD_BL_BUTTON_PIN`                   | GPIO for that button (default **35** = LilyGO **BUTTON1**).                                     |
 | `HUD_BL_BUTTON_ACTIVE_HIGH`           | Default `0` (pressed = LOW). Set to `1` if your board reads HIGH when pressed.                  |
 | `HUD_LEDC_WRITE_USES_GPIO_PIN`        | Usually auto from Arduino core: `0` = `ledcWrite(channel, …)` (core 2.x), `1` = `ledcWrite(GPIO, …)` (core 3.x). Set manually if backlight never changes after a core upgrade. |
@@ -84,6 +104,10 @@ Display pins and **TFT_eSPI** options for the TTGO board are also in `platformio
 3. You should see a boot line with `TFT_BL`, button GPIO, and `ledc_writes_pin` vs `ledc_writes_channel`. Every ~400 ms: `GPIO35 raw=…` (0 = pressed on a typical board), `step`, and `duty`.
 4. If you press the **GPIO35** button and **`step` / `duty` never change** but `raw` toggles, note the `ledc_writes_*` line — after an **Arduino-ESP32 3.x** upgrade you may need `-D HUD_LEDC_WRITE_USES_GPIO_PIN=1` (or `0` if it was wrong).
 5. If **`raw` never changes** when you press either onboard key, try `-D HUD_BL_BUTTON_PIN=0` for **BUTTON2**, or `-D HUD_BL_BUTTON_ACTIVE_HIGH=1` if your hardware is inverted.
+
+### Serial: `ASSERT_WARN(… lc_task.c …)` at boot
+
+Long **`ASSERT_WARN`** lines from **`lc_task.c`** come from the ESP32 **Bluetooth stack** (Bluedroid), not from the OBD parser. They are often seen when Classic BT is active and are usually **non-fatal** if the adapter still connects and telemetry updates.
 
 ## Project layout
 

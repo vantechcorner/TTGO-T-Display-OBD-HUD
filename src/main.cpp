@@ -3,10 +3,12 @@
  * Display: ST7789 135x240, rotation 1 => 240x135 landscape.
  * Driver: TFT_eSPI + LVGL 9 (partial double-buffer, no full-frame flicker).
  *
- * Firmware: V1.1 — onboard GPIO35 button cycles backlight (100% / 50% / 20%).
+ * Firmware: V1.1 — onboard GPIO35 short-press cycles backlight (100% / 50% / 20%).
  */
 
 #include <Arduino.h>
+#include <stdio.h>
+#include <string.h>
 #include <BluetoothSerial.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
@@ -29,14 +31,8 @@
 #ifndef BRIDGE_VOLT_MS
 #define BRIDGE_VOLT_MS 2000U
 #endif
-#ifndef BRIDGE_LIGHTS_MS
-#define BRIDGE_LIGHTS_MS 2000U
-#endif
-#ifndef OBD_LIGHTS_ON_MASK
-#define OBD_LIGHTS_ON_MASK 0x0001u
-#endif
 
-/* 1 = cycle backlight via HUD_BL_BUTTON_PIN. 0 = other logic in this file (no GPIO button polling). */
+/* 1 = cycle backlight via HUD_BL_BUTTON_PIN. 0 = fixed backlight from init (no GPIO button polling). */
 #ifndef HUD_USE_BUTTON_BACKLIGHT
 #define HUD_USE_BUTTON_BACKLIGHT 1
 #endif
@@ -95,9 +91,6 @@ static uint32_t lastFast = 0;
 static uint32_t lastMedium = 0;
 static uint32_t lastSlow = 0;
 static uint32_t lastVolt = 0;
-#if !HUD_USE_BUTTON_BACKLIGHT
-static uint32_t lastLights = 0;
-#endif
 static uint32_t lastReconnectTry = 0;
 
 static int displayRpm = 0;
@@ -107,9 +100,6 @@ static float displayVoltage = 0.f;
 static bool haveData = false;
 static bool haveVoltage = false;
 
-/* PID 0x3E auxiliary I/O — bit(s) set => “lights on” for backlight dim (vehicle-specific) */
-static bool g_obd_lights_valid = false;
-static bool g_obd_lights_on = false;
 /* FontAwesome trong Montserrat không có thermometer (f2c9); LV_SYMBOL_TINT (giọt) nằm trong glyph set */
 #define HUD_SYM_COOLANT LV_SYMBOL_TINT
 
@@ -201,39 +191,6 @@ static void hud_backlight_button_poll()
   g_hud_btn_stable_high = stable_high;
 }
 #endif
-
-/* Lights on (night) => 20%; off or PID never seen => 100% */
-static void backlight_apply_obd_policy()
-{
-#if !HUD_USE_BUTTON_BACKLIGHT
-#ifdef TFT_BL
-  if (!g_obd_lights_valid)
-    backlight_set_duty8(255);
-  else if (g_obd_lights_on)
-    backlight_set_duty8((uint8_t)(255U * 20U / 100U)); /* 20% */
-  else
-    backlight_set_duty8(255);
-#endif
-#endif
-}
-
-static void apply_obd_aux_lights_raw(uint16_t raw)
-{
-#if !HUD_USE_BUTTON_BACKLIGHT
-  g_obd_lights_valid = true;
-  g_obd_lights_on = (raw & (uint16_t)OBD_LIGHTS_ON_MASK) != 0;
-  backlight_apply_obd_policy();
-#else
-  (void)raw;
-#endif
-}
-
-static void obd_lights_reset()
-{
-  g_obd_lights_valid = false;
-  g_obd_lights_on = false;
-  backlight_apply_obd_policy();
-}
 
 static const char *battery_symbol_for_voltage(float v)
 {
@@ -512,13 +469,6 @@ static void parseAllMode41Responses(const String &lineUpper)
       if (i + 6 <= n)
         applyObdCompact(s.substring(i, i + 6));
     }
-    else if (pid == 0x3E)
-    {
-      if (i + 8 <= n)
-        applyObdCompact(s.substring(i, i + 8));
-      else if (i + 6 <= n)
-        applyObdCompact(s.substring(i, i + 6));
-    }
   }
 }
 
@@ -565,17 +515,6 @@ static void applyObdCompact(const String &s)
     {
       displayVoltage = hexByte(s[4], s[5]) / 10.0f;
       haveVoltage = true;
-    }
-    break;
-  case 0x3E: /* Auxiliary input/output status (SAE J1979) — lighting bits vary by ECU */
-    if (s.length() >= 8)
-    {
-      const uint16_t raw = (uint16_t)((hexByte(s[4], s[5]) << 8) | hexByte(s[6], s[7]));
-      apply_obd_aux_lights_raw(raw);
-    }
-    else if (s.length() >= 6)
-    {
-      apply_obd_aux_lights_raw((uint16_t)hexByte(s[4], s[5]));
     }
     break;
   default:
@@ -642,11 +581,7 @@ static void initElm()
   sendElm("ATSP6");
   delay(300);
   obdReady = true;
-  obd_lights_reset();
   lastFast = lastMedium = lastSlow = lastVolt = millis();
-#if !HUD_USE_BUTTON_BACKLIGHT
-  lastLights = millis();
-#endif
 }
 
 static void sync_ui_from_obd()
@@ -712,7 +647,6 @@ void loop()
     obdReady = false;
     haveData = false;
     haveVoltage = false;
-    obd_lights_reset();
     const uint32_t now = millis();
     if (now - lastReconnectTry > 2500)
     {
@@ -765,14 +699,6 @@ void loop()
     lastVolt = now;
     sendElm("0142");
   }
-
-#if !HUD_USE_BUTTON_BACKLIGHT
-  if (now - lastLights >= BRIDGE_LIGHTS_MS)
-  {
-    lastLights = now;
-    sendElm("013E");
-  }
-#endif
 
   sync_ui_from_obd();
   lv_timer_handler();
