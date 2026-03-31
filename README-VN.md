@@ -119,6 +119,7 @@ Các dòng **`ASSERT_WARN`** dài từ **`lc_task.c`** đến từ **stack Bluet
 | ------------------------- | ----------------------------------------------------------------------------- |
 | `src/main.cpp`            | Client ELM327 Bluetooth, parse OBD, giao diện LVGL                          |
 | `include/lv_conf.h`       | Cấu hình LVGL và font bật                                                     |
+| `docs/HANDOFF.md`         | Ghi chú phiên làm việc / nối tiếp dự án cho dev                               |
 | `images/elm_327_mini.png` | Ảnh tham chiếu cho tài liệu                                                   |
 
 

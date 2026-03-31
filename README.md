@@ -119,6 +119,7 @@ Long **`ASSERT_WARN`** lines from **`lc_task.c`** come from the ESP32 **Bluetoot
 | ------------------------- | --------------------------------------------- |
 | `src/main.cpp`            | Bluetooth ELM327 client, OBD parsing, LVGL UI |
 | `include/lv_conf.h`       | LVGL configuration and enabled fonts          |
+| `docs/HANDOFF.md`         | Session / continuation notes for developers     |
 | `images/elm_327_mini.png` | Reference image for documentation             |
 
 
